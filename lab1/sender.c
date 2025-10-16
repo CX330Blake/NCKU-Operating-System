@@ -1,9 +1,15 @@
 #include "sender.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static double g_sender_elapsed_ns = 0.0;
 
 static inline double elapsed_ns(const struct timespec *start,
-				       const struct timespec *end)
+				const struct timespec *end)
 {
 	return ((double)(end->tv_sec - start->tv_sec) * 1e9) +
 	       (double)(end->tv_nsec - start->tv_nsec);
@@ -20,24 +26,58 @@ static inline int monotonic_now(struct timespec *ts)
 
 void send(message_t message, mailbox_t *mailbox_ptr)
 {
-	/*  TODO: 
-        1. Use flag to determine the communication method
-        2. According to the communication method, send the message
-    */
+	/* Measure only "communication actions":
+       - Message Queue: only the successful msgsnd() call duration (use IPC_NOWAIT polling).
+       - Shared Memory: only the time inside the critical section writing to shared memory.
+       Waiting (blocking) must NOT be counted. */
 
-	// (1)
 	if (mailbox_ptr == NULL) {
 		fprintf(stderr, "[Sender] Invalid mailbox pointer.\n");
 		exit(EXIT_FAILURE);
 	}
 
 	if (mailbox_ptr->flag == MSG_PASSING) {
+		// Non-blocking polling; count only the successful msgsnd() call.
 		size_t payload_size = strlen(message.msgText);
-		if (msgsnd(mailbox_ptr->storage.msqid, &message,
-			   payload_size + 1, 0) == -1) {
-			perror("msgsnd");
-			exit(EXIT_FAILURE);
+		if (payload_size + 1 > sizeof(message.msgText)) {
+			payload_size =
+				sizeof(message.msgText) -
+				1; // safety; message.msgText is already NUL-terminated
 		}
+
+		for (;;) {
+			struct timespec s, e;
+			if (monotonic_now(&s) == -1)
+				exit(EXIT_FAILURE);
+
+			int rc = msgsnd(
+				mailbox_ptr->storage.msqid, &message,
+				payload_size +
+					1, // include trailing NUL as part of payload
+				IPC_NOWAIT); // do not block if queue is full
+
+			if (monotonic_now(&e) == -1)
+				exit(EXIT_FAILURE);
+
+			if (rc == -1) {
+				if (errno == EAGAIN) {
+					// Queue full: do NOT add time; back off briefly and retry
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec = 1 * 1000 * 1000
+					}; // 1ms
+					nanosleep(&ts, NULL);
+					continue;
+				}
+				perror("msgsnd");
+				exit(EXIT_FAILURE);
+			}
+
+			// Successful send: accumulate only this system call duration
+			g_sender_elapsed_ns += elapsed_ns(&s, &e);
+			break;
+		}
+
 	} else if (mailbox_ptr->flag == SHARED_MEM) {
 		shm_mailbox_t *shared_box =
 			(shm_mailbox_t *)mailbox_ptr->storage.shm_addr;
@@ -46,15 +86,19 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 				"[Sender] Shared memory not attached.\n");
 			exit(EXIT_FAILURE);
 		}
+
+		// Wait for peer init (not counted)
 		while (!shared_box->ready) {
 			usleep(1000);
 		}
 
+		// Compute payload length (bounded by buffer size)
 		size_t payload_size = strlen(message.msgText);
 		if (payload_size >= sizeof(shared_box->buffer)) {
 			payload_size = sizeof(shared_box->buffer) - 1;
 		}
 
+		// Wait for an empty slot (not counted)
 		int sem_result = 0;
 		do {
 			sem_result = sem_wait(&shared_box->empty);
@@ -64,11 +108,20 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 			exit(EXIT_FAILURE);
 		}
 
+		// Enter critical section (waiting not counted)
 		do {
 			sem_result = sem_wait(&shared_box->mutex);
 		} while (sem_result == -1 && errno == EINTR);
 		if (sem_result == -1) {
 			perror("sem_wait(mutex)");
+			exit(EXIT_FAILURE);
+		}
+
+		// ===== Measure ONLY the shared-memory write section =====
+		struct timespec s, e;
+		if (monotonic_now(&s) == -1) {
+			sem_post(&shared_box->mutex);
+			sem_post(&shared_box->empty);
 			exit(EXIT_FAILURE);
 		}
 
@@ -78,6 +131,15 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 		shared_box->is_exit =
 			(strcmp(message.msgText, EXIT_MESSAGE) == 0) ? 1 : 0;
 
+		if (monotonic_now(&e) == -1) {
+			sem_post(&shared_box->mutex);
+			sem_post(&shared_box->empty);
+			exit(EXIT_FAILURE);
+		}
+		g_sender_elapsed_ns += elapsed_ns(&s, &e);
+		// ===== End of measured section =====
+
+		// Leave critical section and signal "full"
 		if (sem_post(&shared_box->mutex) == -1) {
 			perror("sem_post(mutex)");
 			exit(EXIT_FAILURE);
@@ -86,6 +148,7 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 			perror("sem_post(full)");
 			exit(EXIT_FAILURE);
 		}
+
 	} else {
 		fprintf(stderr, "[Sender] Unsupported IPC mechanism: %d\n",
 			mailbox_ptr->flag);
@@ -95,20 +158,8 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 
 int main(int argc, char *argv[])
 {
-	/*  TODO: 
-        1) Call send(message, &mailbox) according to the flow in slide 4
-        2) Measure the total sending time
-        3) Get the mechanism and the input file from command line arguments
-            • e.g. ./sender 1 input.txt
-                    (1 for Message Passing, 2 for Shared Memory)
-        4) Get the messages to be sent from the input file
-        5) Print information on the console according to the output format
-        6) If the message form the input file is EOF, send an exit message to the receiver.c
-        7) Print the total sending time and terminate the sender.c
-    */
+	/* Follow lab flow; total time is accumulated inside send() via g_sender_elapsed_ns. */
 
-	struct timespec start_time;
-	struct timespec end_time;
 	mailbox_t mailbox;
 	memset(&mailbox, 0, sizeof(mailbox));
 
@@ -124,7 +175,8 @@ int main(int argc, char *argv[])
 	g_sender_elapsed_ns = 0.0;
 
 	if (argc != 3) {
-		fprintf(stderr, "Usage: %s <mechanism> <input_file>\n", argv[0]);
+		fprintf(stderr, "Usage: %s <mechanism> <input_file>\n",
+			argv[0]);
 		return EXIT_FAILURE;
 	}
 
@@ -147,6 +199,7 @@ int main(int argc, char *argv[])
 		}
 		mailbox.flag = MSG_PASSING;
 		mailbox.storage.msqid = msqid;
+
 	} else if (mechanism == SHARED_MEM) {
 		printf("\033[92mShared Memory\033[0m\n");
 		ipc_key = ftok(".", 'S');
@@ -155,6 +208,7 @@ int main(int argc, char *argv[])
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
 		}
+
 		shmid = shmget(ipc_key, sizeof(shm_mailbox_t),
 			       IPC_CREAT | IPC_EXCL | 0666);
 		if (shmid == -1) {
@@ -210,6 +264,7 @@ int main(int argc, char *argv[])
 
 		mailbox.flag = SHARED_MEM;
 		mailbox.storage.shm_addr = (char *)shared_block;
+
 	} else {
 		fprintf(stderr, "Invalid mechanism type: %d\n", mechanism);
 		exit_code = EXIT_FAILURE;
@@ -243,23 +298,15 @@ int main(int argc, char *argv[])
 				sizeof(message.msgText) - 1);
 			message.msgText[sizeof(message.msgText) - 1] = '\0';
 			message.mType = 1;
-			printf("\033[92mSending message:\033[0m %s\n", message.msgText);
+			printf("\033[92mSending message:\033[0m %s\n",
+			       message.msgText);
 		}
 
-		if (monotonic_now(&start_time) == -1) {
-			exit_code = EXIT_FAILURE;
-			goto cleanup;
-		}
+		// Precise measurement happens inside send()
 		send(message, &mailbox);
-		if (monotonic_now(&end_time) == -1) {
-			exit_code = EXIT_FAILURE;
-			goto cleanup;
-		}
-		g_sender_elapsed_ns += elapsed_ns(&start_time, &end_time);
 
-		if (exit_sent) {
+		if (exit_sent)
 			break;
-		}
 	}
 
 	if (!exit_sent) {
@@ -268,27 +315,18 @@ int main(int argc, char *argv[])
 		message.msgText[sizeof(message.msgText) - 1] = '\0';
 		message.mType = 2;
 		printf("\033[91mEnd of input file! exit!\033[0m\n");
-		if (monotonic_now(&start_time) == -1) {
-			exit_code = EXIT_FAILURE;
-			goto cleanup;
-		}
 		send(message, &mailbox);
-		if (monotonic_now(&end_time) == -1) {
-			exit_code = EXIT_FAILURE;
-			goto cleanup;
-		}
-		g_sender_elapsed_ns += elapsed_ns(&start_time, &end_time);
 	}
 
 	printf("Total time taken in sending msg: %.6f s\n",
 	       g_sender_elapsed_ns / 1e9);
 
 cleanup:
-	if (input_file != NULL) {
+	if (input_file != NULL)
 		fclose(input_file);
-	}
 
 	if (mailbox.flag == SHARED_MEM && shared_block != NULL) {
+		// If something failed early and we created the segment, clean up semaphores/segment.
 		if (exit_code != EXIT_SUCCESS && created_shared_memory) {
 			sem_destroy(&shared_block->full);
 			sem_destroy(&shared_block->empty);
@@ -308,3 +346,4 @@ cleanup:
 
 	return exit_code;
 }
+
