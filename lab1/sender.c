@@ -6,22 +6,17 @@
 #include <time.h>
 #include <unistd.h>
 
-static double g_sender_elapsed_ns = 0.0;
+struct timespec start, end;
+double time_taken;
 
-static inline double elapsed_ns(const struct timespec *start,
-				const struct timespec *end)
+static inline void time_start()
 {
-	return ((double)(end->tv_sec - start->tv_sec) * 1e9) +
-	       (double)(end->tv_nsec - start->tv_nsec);
+	clock_gettime(CLOCK_MONOTONIC, &start);
 }
 
-static inline int monotonic_now(struct timespec *ts)
+static inline void time_end()
 {
-	if (clock_gettime(CLOCK_MONOTONIC, ts) == -1) {
-		perror("clock_gettime");
-		return -1;
-	}
-	return 0;
+	clock_gettime(CLOCK_MONOTONIC, &end);
 }
 
 void send(message_t message, mailbox_t *mailbox_ptr)
@@ -46,9 +41,7 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 		}
 
 		for (;;) {
-			struct timespec s, e;
-			if (monotonic_now(&s) == -1)
-				exit(EXIT_FAILURE);
+			time_start();
 
 			int rc = msgsnd(
 				mailbox_ptr->storage.msqid, &message,
@@ -56,8 +49,7 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 					1, // include trailing NUL as part of payload
 				IPC_NOWAIT); // do not block if queue is full
 
-			if (monotonic_now(&e) == -1)
-				exit(EXIT_FAILURE);
+			time_end();
 
 			if (rc == -1) {
 				if (errno == EAGAIN) {
@@ -73,8 +65,9 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 				exit(EXIT_FAILURE);
 			}
 
-			// Successful send: accumulate only this system call duration
-			g_sender_elapsed_ns += elapsed_ns(&s, &e);
+			time_taken += ((end.tv_sec - start.tv_sec) +
+				       (end.tv_nsec - start.tv_nsec) / 1e9);
+
 			break;
 		}
 
@@ -117,13 +110,7 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 			exit(EXIT_FAILURE);
 		}
 
-		// ===== Measure ONLY the shared-memory write section =====
-		struct timespec s, e;
-		if (monotonic_now(&s) == -1) {
-			sem_post(&shared_box->mutex);
-			sem_post(&shared_box->empty);
-			exit(EXIT_FAILURE);
-		}
+		time_start();
 
 		memcpy(shared_box->buffer, message.msgText, payload_size);
 		shared_box->buffer[payload_size] = '\0';
@@ -131,13 +118,10 @@ void send(message_t message, mailbox_t *mailbox_ptr)
 		shared_box->is_exit =
 			(strcmp(message.msgText, EXIT_MESSAGE) == 0) ? 1 : 0;
 
-		if (monotonic_now(&e) == -1) {
-			sem_post(&shared_box->mutex);
-			sem_post(&shared_box->empty);
-			exit(EXIT_FAILURE);
-		}
-		g_sender_elapsed_ns += elapsed_ns(&s, &e);
-		// ===== End of measured section =====
+		time_end();
+
+		time_taken += ((end.tv_sec - start.tv_sec) +
+			       (end.tv_nsec - start.tv_nsec) / 1e9);
 
 		// Leave critical section and signal "full"
 		if (sem_post(&shared_box->mutex) == -1) {
@@ -171,8 +155,6 @@ int main(int argc, char *argv[])
 	FILE *input_file = NULL;
 	int exit_code = EXIT_SUCCESS;
 	int exit_sent = 0;
-
-	g_sender_elapsed_ns = 0.0;
 
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <mechanism> <input_file>\n",
@@ -318,8 +300,7 @@ int main(int argc, char *argv[])
 		send(message, &mailbox);
 	}
 
-	printf("Total time taken in sending msg: %.6f s\n",
-	       g_sender_elapsed_ns / 1e9);
+	printf("Total time taken in sending msg: %.6f s\n", time_taken);
 
 cleanup:
 	if (input_file != NULL)
@@ -346,4 +327,3 @@ cleanup:
 
 	return exit_code;
 }
-

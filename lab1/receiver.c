@@ -1,4 +1,5 @@
 #include "receiver.h"
+#include <bits/time.h>
 #include <stdio.h>
 #include <errno.h>
 #include <time.h>
@@ -6,22 +7,120 @@
 #include <string.h>
 #include <stdlib.h>
 
-static double g_receiver_elapsed_ns = 0.0;
+struct timespec start, end;
+double time_taken;
 
-static inline double elapsed_ns(const struct timespec *start,
-				const struct timespec *end)
+static inline void time_start()
 {
-	return ((double)(end->tv_sec - start->tv_sec) * 1e9) +
-	       (double)(end->tv_nsec - start->tv_nsec);
+	clock_gettime(CLOCK_MONOTONIC, &start);
 }
 
-static inline int monotonic_now(struct timespec *ts)
+static inline void time_end()
 {
-	if (clock_gettime(CLOCK_MONOTONIC, ts) == -1) {
-		perror("clock_gettime");
-		return -1;
+	clock_gettime(CLOCK_MONOTONIC, &end);
+}
+
+void recv_via_msg_passing(message_t *message_ptr, mailbox_t *mailbox_ptr)
+{
+	// Message Queue: poll using IPC_NOWAIT; measure only the successful msgrcv() call
+	for (;;) {
+		time_start();
+		ssize_t received_size = msgrcv(
+			mailbox_ptr->storage.msqid, message_ptr,
+			sizeof(message_ptr->msgText), 0,
+			IPC_NOWAIT); // Non-blocking: return immediately if no message
+		time_end();
+
+		if (received_size == -1) {
+			if (errno == ENOMSG) {
+				// No message yet → do not count this attempt
+				struct timespec ts = {
+					.tv_sec = 0,
+					.tv_nsec = 1 * 1000 * 1000 // sleep 1ms
+				};
+				nanosleep(&ts, NULL);
+				continue;
+			}
+			perror("msgrcv");
+			exit(EXIT_FAILURE);
+		}
+
+		time_taken += ((end.tv_sec - start.tv_sec) +
+			       (end.tv_nsec - start.tv_nsec) / 1e9);
+
+		// Null-terminate the received text
+		if (received_size >= (ssize_t)sizeof(message_ptr->msgText)) {
+			message_ptr->msgText[sizeof(message_ptr->msgText) - 1] =
+				'\0';
+		} else {
+			message_ptr->msgText[received_size] = '\0';
+		}
+		break;
 	}
-	return 0;
+}
+
+void recv_via_memory_sharing(message_t *message_ptr, mailbox_t *mailbox_ptr)
+{
+	// Shared Memory: measure only actual memory access, not semaphore waits
+	shm_mailbox_t *shared_box =
+		(shm_mailbox_t *)mailbox_ptr->storage.shm_addr;
+	if (shared_box == NULL) {
+		fprintf(stderr, "[Receiver] Shared memory not attached.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	// Wait until the shared memory is ready (not counted)
+	while (!shared_box->ready) {
+		usleep(1000);
+	}
+
+	// Wait for "full" semaphore (producer ready) — not counted
+	int sem_result = 0;
+	do {
+		sem_result = sem_wait(&shared_box->full);
+	} while (sem_result == -1 && errno == EINTR);
+	if (sem_result == -1) {
+		perror("sem_wait(full)");
+		exit(EXIT_FAILURE);
+	}
+
+	// Enter critical section — waiting time not measured
+	do {
+		sem_result = sem_wait(&shared_box->mutex);
+	} while (sem_result == -1 && errno == EINTR);
+	if (sem_result == -1) {
+		perror("sem_wait(mutex)");
+		exit(EXIT_FAILURE);
+	}
+
+	size_t copy_length = shared_box->length;
+	if (copy_length >= sizeof(message_ptr->msgText)) {
+		copy_length = sizeof(message_ptr->msgText) - 1;
+	}
+
+	time_start();
+
+	memcpy(message_ptr->msgText, shared_box->buffer, copy_length);
+	message_ptr->msgText[copy_length] = '\0';
+	message_ptr->mType = shared_box->is_exit ? 2 : 1;
+	// Clear shared buffer flags (also part of memory access)
+	shared_box->length = 0;
+	shared_box->is_exit = 0;
+	shared_box->buffer[0] = '\0';
+
+	time_end();
+
+	// Exit critical section and signal the empty semaphore
+	if (sem_post(&shared_box->mutex) == -1) {
+		perror("sem_post(mutex)");
+		exit(EXIT_FAILURE);
+	}
+	if (sem_post(&shared_box->empty) == -1) {
+		perror("sem_post(empty)");
+		exit(EXIT_FAILURE);
+	}
+	time_taken += ((end.tv_sec - start.tv_sec) +
+		       (end.tv_nsec - start.tv_nsec) / 1e9);
 }
 
 void receive(message_t *message_ptr, mailbox_t *mailbox_ptr)
@@ -32,135 +131,16 @@ void receive(message_t *message_ptr, mailbox_t *mailbox_ptr)
 		2. Receive the message according to the chosen mechanism.
 	*/
 
-	// (1) Validate input
-	if (mailbox_ptr == NULL || message_ptr == NULL) {
-		fprintf(stderr,
-			"[Receiver] Invalid mailbox or message pointer.\n");
-		exit(EXIT_FAILURE);
+	switch (mailbox_ptr->flag) {
+	case MSG_PASSING: {
+		recv_via_msg_passing(message_ptr, mailbox_ptr);
+		break;
 	}
-
-	if (mailbox_ptr->flag == MSG_PASSING) {
-		// Message Queue: poll using IPC_NOWAIT; measure only the successful msgrcv() call
-		for (;;) {
-			struct timespec s, e;
-
-			if (monotonic_now(&s) == -1) {
-				exit(EXIT_FAILURE);
-			}
-
-			ssize_t received_size = msgrcv(
-				mailbox_ptr->storage.msqid, message_ptr,
-				sizeof(message_ptr->msgText), 0,
-				IPC_NOWAIT); // Non-blocking: return immediately if no message
-
-			if (monotonic_now(&e) == -1) {
-				exit(EXIT_FAILURE);
-			}
-
-			if (received_size == -1) {
-				if (errno == ENOMSG) {
-					// No message yet → do not count this attempt
-					struct timespec ts = {
-						.tv_sec = 0,
-						.tv_nsec = 1 * 1000 *
-							   1000 // sleep 1ms
-					};
-					nanosleep(&ts, NULL);
-					continue;
-				}
-				perror("msgrcv");
-				exit(EXIT_FAILURE);
-			}
-
-			// Successfully received → add only this system call duration
-			g_receiver_elapsed_ns += elapsed_ns(&s, &e);
-
-			// Null-terminate the received text
-			if (received_size >=
-			    (ssize_t)sizeof(message_ptr->msgText)) {
-				message_ptr
-					->msgText[sizeof(message_ptr->msgText) -
-						  1] = '\0';
-			} else {
-				message_ptr->msgText[received_size] = '\0';
-			}
-			break;
-		}
-
-	} else if (mailbox_ptr->flag == SHARED_MEM) {
-		// Shared Memory: measure only actual memory access, not semaphore waits
-		shm_mailbox_t *shared_box =
-			(shm_mailbox_t *)mailbox_ptr->storage.shm_addr;
-		if (shared_box == NULL) {
-			fprintf(stderr,
-				"[Receiver] Shared memory not attached.\n");
-			exit(EXIT_FAILURE);
-		}
-
-		// Wait until the shared memory is ready (not counted)
-		while (!shared_box->ready) {
-			usleep(1000);
-		}
-
-		// Wait for "full" semaphore (producer ready) — not counted
-		int sem_result = 0;
-		do {
-			sem_result = sem_wait(&shared_box->full);
-		} while (sem_result == -1 && errno == EINTR);
-		if (sem_result == -1) {
-			perror("sem_wait(full)");
-			exit(EXIT_FAILURE);
-		}
-
-		// Enter critical section — waiting time not measured
-		do {
-			sem_result = sem_wait(&shared_box->mutex);
-		} while (sem_result == -1 && errno == EINTR);
-		if (sem_result == -1) {
-			perror("sem_wait(mutex)");
-			exit(EXIT_FAILURE);
-		}
-
-		// ======= Measure only the actual shared memory access =======
-		struct timespec s, e;
-		if (monotonic_now(&s) == -1) {
-			sem_post(&shared_box->mutex);
-			sem_post(&shared_box->empty);
-			exit(EXIT_FAILURE);
-		}
-
-		size_t copy_length = shared_box->length;
-		if (copy_length >= sizeof(message_ptr->msgText)) {
-			copy_length = sizeof(message_ptr->msgText) - 1;
-		}
-		memcpy(message_ptr->msgText, shared_box->buffer, copy_length);
-		message_ptr->msgText[copy_length] = '\0';
-		message_ptr->mType = shared_box->is_exit ? 2 : 1;
-
-		// Clear shared buffer flags (also part of memory access)
-		shared_box->length = 0;
-		shared_box->is_exit = 0;
-		shared_box->buffer[0] = '\0';
-
-		if (monotonic_now(&e) == -1) {
-			sem_post(&shared_box->mutex);
-			sem_post(&shared_box->empty);
-			exit(EXIT_FAILURE);
-		}
-		g_receiver_elapsed_ns += elapsed_ns(&s, &e);
-		// ======= End of measured section =======
-
-		// Exit critical section and signal the empty semaphore
-		if (sem_post(&shared_box->mutex) == -1) {
-			perror("sem_post(mutex)");
-			exit(EXIT_FAILURE);
-		}
-		if (sem_post(&shared_box->empty) == -1) {
-			perror("sem_post(empty)");
-			exit(EXIT_FAILURE);
-		}
-
-	} else {
+	case SHARED_MEM: {
+		recv_via_memory_sharing(message_ptr, mailbox_ptr);
+		break;
+	}
+	default:
 		fprintf(stderr, "[Receiver] Unsupported IPC mechanism: %d\n",
 			mailbox_ptr->flag);
 		exit(EXIT_FAILURE);
@@ -189,8 +169,6 @@ int main(int argc, char *argv[])
 	shm_mailbox_t *shared_block = NULL;
 	int exit_code = EXIT_SUCCESS;
 	int exit_received = 0;
-
-	g_receiver_elapsed_ns = 0.0;
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <mechanism>\n", argv[0]);
@@ -308,8 +286,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	printf("Total time taken in receiving msg: %.6f s\n",
-	       g_receiver_elapsed_ns / 1e9);
+	printf("Total time taken in receiving msg: %.6f s\n", time_taken);
 
 cleanup:
 	if (mailbox.flag == MSG_PASSING && msqid != -1 &&
