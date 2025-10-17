@@ -19,120 +19,121 @@ static inline void time_end()
 	clock_gettime(CLOCK_MONOTONIC, &end);
 }
 
+void send_via_msg_passing(message_t message, mailbox_t *mailbox_ptr)
+{
+	// Non-blocking polling; count only the successful msgsnd() call.
+	size_t payload_size = strlen(message.msgText);
+	if (payload_size + 1 > sizeof(message.msgText)) {
+		payload_size =
+			sizeof(message.msgText) -
+			1; // safety; message.msgText is already NUL-terminated
+	}
+
+	for (;;) {
+		time_start();
+
+		int rc = msgsnd(
+			mailbox_ptr->storage.msqid, &message,
+			payload_size +
+				1, // include trailing NUL as part of payload
+			IPC_NOWAIT); // do not block if queue is full
+
+		time_end();
+
+		if (rc == -1) {
+			if (errno == EAGAIN) {
+				// Queue full: do NOT add time; back off briefly and retry
+				struct timespec ts = {
+					.tv_sec = 0, .tv_nsec = 1 * 1000 * 1000
+				}; // 1ms
+				nanosleep(&ts, NULL);
+				continue;
+			}
+			perror("msgsnd");
+			exit(EXIT_FAILURE);
+		}
+
+		time_taken += ((end.tv_sec - start.tv_sec) +
+			       (end.tv_nsec - start.tv_nsec) / 1e9);
+
+		break;
+	}
+}
+
+void send_via_memory_sharing(message_t message, mailbox_t *mailbox_ptr)
+{
+	shm_mailbox_t *shared_box =
+		(shm_mailbox_t *)mailbox_ptr->storage.shm_addr;
+	if (shared_box == NULL) {
+		fprintf(stderr, "[Sender] Shared memory not attached.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	// Wait for peer init (not counted)
+	while (!shared_box->ready) {
+		usleep(1000);
+	}
+
+	// Compute payload length (bounded by buffer size)
+	size_t payload_size = strlen(message.msgText);
+	if (payload_size >= sizeof(shared_box->buffer)) {
+		payload_size = sizeof(shared_box->buffer) - 1;
+	}
+
+	// Wait for an empty slot (not counted)
+	int sem_result = 0;
+	do {
+		sem_result = sem_wait(&shared_box->empty);
+	} while (sem_result == -1 && errno == EINTR);
+	if (sem_result == -1) {
+		perror("sem_wait(empty)");
+		exit(EXIT_FAILURE);
+	}
+
+	// Enter critical section (waiting not counted)
+	do {
+		sem_result = sem_wait(&shared_box->mutex);
+	} while (sem_result == -1 && errno == EINTR);
+	if (sem_result == -1) {
+		perror("sem_wait(mutex)");
+		exit(EXIT_FAILURE);
+	}
+
+	time_start();
+
+	memcpy(shared_box->buffer, message.msgText, payload_size);
+	shared_box->buffer[payload_size] = '\0';
+	shared_box->length = payload_size;
+	shared_box->is_exit = (strcmp(message.msgText, EXIT_MESSAGE) == 0) ? 1 :
+									     0;
+
+	time_end();
+
+	time_taken += ((end.tv_sec - start.tv_sec) +
+		       (end.tv_nsec - start.tv_nsec) / 1e9);
+
+	// Leave critical section and signal "full"
+	if (sem_post(&shared_box->mutex) == -1) {
+		perror("sem_post(mutex)");
+		exit(EXIT_FAILURE);
+	}
+	if (sem_post(&shared_box->full) == -1) {
+		perror("sem_post(full)");
+		exit(EXIT_FAILURE);
+	}
+}
+
 void send(message_t message, mailbox_t *mailbox_ptr)
 {
-	/* Measure only "communication actions":
-       - Message Queue: only the successful msgsnd() call duration (use IPC_NOWAIT polling).
-       - Shared Memory: only the time inside the critical section writing to shared memory.
-       Waiting (blocking) must NOT be counted. */
-
 	if (mailbox_ptr == NULL) {
 		fprintf(stderr, "[Sender] Invalid mailbox pointer.\n");
 		exit(EXIT_FAILURE);
 	}
 
 	if (mailbox_ptr->flag == MSG_PASSING) {
-		// Non-blocking polling; count only the successful msgsnd() call.
-		size_t payload_size = strlen(message.msgText);
-		if (payload_size + 1 > sizeof(message.msgText)) {
-			payload_size =
-				sizeof(message.msgText) -
-				1; // safety; message.msgText is already NUL-terminated
-		}
-
-		for (;;) {
-			time_start();
-
-			int rc = msgsnd(
-				mailbox_ptr->storage.msqid, &message,
-				payload_size +
-					1, // include trailing NUL as part of payload
-				IPC_NOWAIT); // do not block if queue is full
-
-			time_end();
-
-			if (rc == -1) {
-				if (errno == EAGAIN) {
-					// Queue full: do NOT add time; back off briefly and retry
-					struct timespec ts = {
-						.tv_sec = 0,
-						.tv_nsec = 1 * 1000 * 1000
-					}; // 1ms
-					nanosleep(&ts, NULL);
-					continue;
-				}
-				perror("msgsnd");
-				exit(EXIT_FAILURE);
-			}
-
-			time_taken += ((end.tv_sec - start.tv_sec) +
-				       (end.tv_nsec - start.tv_nsec) / 1e9);
-
-			break;
-		}
-
+		send_via_msg_passing(message, mailbox_ptr);
 	} else if (mailbox_ptr->flag == SHARED_MEM) {
-		shm_mailbox_t *shared_box =
-			(shm_mailbox_t *)mailbox_ptr->storage.shm_addr;
-		if (shared_box == NULL) {
-			fprintf(stderr,
-				"[Sender] Shared memory not attached.\n");
-			exit(EXIT_FAILURE);
-		}
-
-		// Wait for peer init (not counted)
-		while (!shared_box->ready) {
-			usleep(1000);
-		}
-
-		// Compute payload length (bounded by buffer size)
-		size_t payload_size = strlen(message.msgText);
-		if (payload_size >= sizeof(shared_box->buffer)) {
-			payload_size = sizeof(shared_box->buffer) - 1;
-		}
-
-		// Wait for an empty slot (not counted)
-		int sem_result = 0;
-		do {
-			sem_result = sem_wait(&shared_box->empty);
-		} while (sem_result == -1 && errno == EINTR);
-		if (sem_result == -1) {
-			perror("sem_wait(empty)");
-			exit(EXIT_FAILURE);
-		}
-
-		// Enter critical section (waiting not counted)
-		do {
-			sem_result = sem_wait(&shared_box->mutex);
-		} while (sem_result == -1 && errno == EINTR);
-		if (sem_result == -1) {
-			perror("sem_wait(mutex)");
-			exit(EXIT_FAILURE);
-		}
-
-		time_start();
-
-		memcpy(shared_box->buffer, message.msgText, payload_size);
-		shared_box->buffer[payload_size] = '\0';
-		shared_box->length = payload_size;
-		shared_box->is_exit =
-			(strcmp(message.msgText, EXIT_MESSAGE) == 0) ? 1 : 0;
-
-		time_end();
-
-		time_taken += ((end.tv_sec - start.tv_sec) +
-			       (end.tv_nsec - start.tv_nsec) / 1e9);
-
-		// Leave critical section and signal "full"
-		if (sem_post(&shared_box->mutex) == -1) {
-			perror("sem_post(mutex)");
-			exit(EXIT_FAILURE);
-		}
-		if (sem_post(&shared_box->full) == -1) {
-			perror("sem_post(full)");
-			exit(EXIT_FAILURE);
-		}
-
+		send_via_memory_sharing(message, mailbox_ptr);
 	} else {
 		fprintf(stderr, "[Sender] Unsupported IPC mechanism: %d\n",
 			mailbox_ptr->flag);
