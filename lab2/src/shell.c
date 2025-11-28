@@ -26,10 +26,11 @@ void redirection(struct cmd_node *p)
 		int fd = open(p->in_file, O_RDONLY);
 		if (fd < 0) {
 			perror(p->in_file);
+			exit(EXIT_FAILURE);
 		}
 		dup2(fd, STDIN_FILENO);
 		close(fd);
-	} else if (p->in != STDIN_FILENO) {
+	} else if (p->in != STDIN_FILENO) { // pipe
 		dup2(p->in, STDIN_FILENO);
 	}
 	// out file
