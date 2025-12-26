@@ -67,9 +67,11 @@ int spawn_proc(struct cmd_node *p)
 		return -1;
 	} else if (pid == 0) { // child
 		redirection(p);
-		execvp(p->args[0], p->args);
-		perror(p->args[0]);
-		exit(EXIT_FAILURE);
+		int status = execvp(p->args[0], p->args);
+		if (status < 0) {
+			perror("execvp");
+			exit(EXIT_FAILURE);
+		}
 	} else { // parent
 		int status;
 		waitpid(pid, &status, 0);
