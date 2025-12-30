@@ -85,4 +85,20 @@ extern const struct inode_operations osfs_dir_inode_operations;
 extern const struct file_operations osfs_dir_operations;
 extern const struct super_operations osfs_super_ops;
 
+/* Extent support */
+#define OSFS_EXTENT_MAGIC 0x4F534558 /* "OSEX" */
+#define OSFS_MAX_EXTENTS                                                      \
+	((BLOCK_SIZE - sizeof(struct osfs_extent_header)) /                   \
+	 sizeof(struct osfs_extent))
+
+struct osfs_extent_header {
+	uint32_t magic;
+	uint32_t count;
+};
+
+struct osfs_extent {
+	uint32_t start;
+	uint32_t len;
+};
+
 #endif /* _osfs_H */

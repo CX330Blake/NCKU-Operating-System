@@ -1,0 +1,2 @@
+sudo touch test.txt
+sudo bash -c 'echo "I LOVE OSLAB" > test.txt'
