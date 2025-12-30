@@ -55,7 +55,7 @@ void data_processing(void)
 void *thread1(void *arg)
 {
 	char data[30];
-	sprintf(data, "%s", "Thread 1 says hello!");
+	sprintf(data, "%s", "Thread 1 says hello!\n");
 
 #if (THREAD_NUMBER == 1)
 	for (int i = 0; i < matrix_row_x; i++) {
@@ -80,7 +80,8 @@ void *thread1(void *arg)
 	static bool lock_initialized;
 	bool locked = false;
 
-	if (!lock_initialized && pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE) == 0)
+	if (!lock_initialized &&
+	    pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE) == 0)
 		lock_initialized = true;
 
 	if (lock_initialized && pthread_spin_lock(&lock) == 0)
@@ -98,7 +99,8 @@ void *thread1(void *arg)
 	char buffer[50];
 	if (locked && fptr4 != NULL)
 		rewind(fptr4);
-	while (locked && fptr4 != NULL && fgets(buffer, sizeof(buffer), fptr4) != NULL) {
+	while (locked && fptr4 != NULL &&
+	       fgets(buffer, sizeof(buffer), fptr4) != NULL) {
 		printf("%s", buffer);
 	}
 
@@ -116,7 +118,7 @@ void *thread1(void *arg)
 void *thread2(void *arg)
 {
 	char data[30];
-	sprintf(data, "%s", "Thread 2 says hello!");
+	sprintf(data, "%s", "Thread 2 says hello!\n");
 	for (int i = matrix_row_x / 2; i < matrix_row_x; i++) {
 		for (int j = 0; j < matrix_col_y; j++) {
 			for (int k = 0; k < matrix_row_y; k++) {
@@ -130,7 +132,8 @@ void *thread2(void *arg)
 	static bool lock_initialized;
 	bool locked = false;
 
-	if (!lock_initialized && pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE) == 0)
+	if (!lock_initialized &&
+	    pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE) == 0)
 		lock_initialized = true;
 
 	if (lock_initialized && pthread_spin_lock(&lock) == 0)
@@ -149,7 +152,8 @@ void *thread2(void *arg)
 	char buffer[50];
 	if (locked && fptr5 != NULL)
 		rewind(fptr5);
-	while (locked && fptr5 != NULL && fgets(buffer, sizeof(buffer), fptr5) != NULL) {
+	while (locked && fptr5 != NULL &&
+	       fgets(buffer, sizeof(buffer), fptr5) != NULL) {
 		printf("%s", buffer);
 	}
 
